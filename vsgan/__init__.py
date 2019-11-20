@@ -10,6 +10,7 @@ import functools
 import mvsfunc
 import numpy as np
 import torch
+import pkgutil
 import vapoursynth as vs
 from vapoursynth import core
 
@@ -17,7 +18,12 @@ from vapoursynth import core
 class VSGAN:
 
     def __init__(self, device="cuda"):
-        self.torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
+        #Set a Google TPU as the device, if availibe. 
+        if pkgutil.find_loader("torch_xla"):
+            import torch_xla.core.xla_model as xm
+            self.torch_device = xm.xla_device()
+        else:
+             self.torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
         # Stubs
         self.model_file = None
         self.model_scale = None
