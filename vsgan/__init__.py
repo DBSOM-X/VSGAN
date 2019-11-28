@@ -10,20 +10,21 @@ import functools
 import mvsfunc
 import numpy as np
 import torch
-import pkgutil
+#import pkgutil
 import vapoursynth as vs
 from vapoursynth import core
 
 
 class VSGAN:
+    #set 
+    pad = 8
 
     def __init__(self, device="cuda"):
-        #Set a Google TPU as the device, if availibe. 
-        if pkgutil.find_loader("torch_xla"):
-            import torch_xla.core.xla_model as xm
-            self.torch_device = xm.xla_device()
-        else:
-             self.torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
+        #Check for a Google TPU. Not needed now, as I can't get the any ESRGANmodels to load with it...  
+        #if pkgutil.find_loader("torch_xla"):
+        #    import torch_xla.core.xla_model as xm
+        #    self.torch_device = xm.xla_device()
+        self.torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
         # Stubs
         self.model_file = None
         self.model_scale = None
@@ -45,7 +46,79 @@ class VSGAN:
         self.rrdb_net_model.eval()
         self.rrdb_net_model = self.rrdb_net_model.to(self.torch_device)
 
-    def run(self, clip, chunk=False):
+    def run(self, clip, chunk=False, reconvert=False):
+        
+        #Makes a horizontal or vertical grayscale, FP32 gradient ramp VS clip
+        #White is on the right/bottom, black is on the left/top
+        #Based on https://forum.doom9.org/showthread.php?p=1885013
+        def make_gradient(WIDTH, HEIGHT, length, vertical = False):
+            #https://stackoverflow.com/questions/4337902/how-to-fill-opencv-image-with-one-solid-color
+            def create_blank(width, height, color=(0, 0, 0)):
+                image = np.zeros((height, width, 3), np.uint8)
+                #color = tuple(reversed(color))
+                image[:] = color
+                return image
+                
+            #https://github.com/KotoriCANOE/MyTF/blob/master/utils/vshelper.py
+            def float32_vsclip(s, clip=None):
+                assert isinstance(s, np.ndarray)
+                core = vs.get_core()
+                if len(s.shape) <= 3: s = s.reshape([1] + list(s.shape))
+                num = s.shape[-4]
+                height = s.shape[-3]
+                width = s.shape[-2]
+                planes = 1
+                if clip is None:
+                    clip = core.std.BlankClip(None, width, height, vs.GRAYS, num)
+            
+                def convert_func(n, f):
+                    fout = f.copy()
+                    for p in range(planes):
+                        d = np.array(fout.get_write_array(p), copy=False)
+                        np.copyto(d, s[n, :, :, p])
+                        del d
+                    return fout
+                return core.std.ModifyFrame(clip, clip, convert_func)
+            
+            color1 = (0)
+            color2 = (255)
+            img1 = create_blank(WIDTH, HEIGHT, color1).astype(np.float32)/255.0
+            img2 = create_blank(WIDTH, HEIGHT, color2).astype(np.float32)/255.0
+            if vertical:
+                c = np.linspace(0, 1, HEIGHT)[:, None, None]
+            else:
+                c = np.linspace(0, 1, WIDTH)[None,:, None] 
+            gradient = img1 + (img2 - img1) * c
+            clip = float32_vsclip(gradient)
+            return core.std.Loop(clip, length)
+        
+        #Like stackhorizontal, but with padding
+        def merge_horizontal(left, right, pad):
+            if (left.height, left.num_frames, left.format) != (right.height, right.num_frames, right.format):
+                raise Exception("Left and right clip must have the same height, format and number of frames!")
+            mask = make_gradient(pad, left.height, left.num_frames)
+            mask = core.std.AddBorders(mask, left = left.width - pad, color = [0.0])
+            mask = core.std.AddBorders(mask, right = right.width - pad, color = [1.0])
+            lwidth = left.width
+            rwidth = right.width
+            left = core.std.AddBorders(left, right = rwidth - pad)
+            right = core.std.AddBorders(right, left = lwidth - pad)
+            return core.std.MaskedMerge(left, right, mask)
+
+        #Like stackvertical, but with padding
+        def merge_vertical(top, bottom, pad):
+            if (top.width, top.num_frames, top.format) != (bottom.width, bottom.num_frames, bottom.format):
+                raise Exception("Top and bottom clip must have the same height, format and number of frames!")
+            mask = make_gradient(top.width, pad, top.num_frames, vertical = True)
+            mask = core.std.AddBorders(mask, top = top.height - pad, color = [0.0])
+            mask = core.std.AddBorders(mask, bottom = bottom.height - pad, color = [1.0])
+            theight = top.height
+            bheight = bottom.height
+            top = core.std.AddBorders(top, bottom = bheight - pad)
+            bottom = core.std.AddBorders(bottom, top = theight - pad)
+            return core.std.MaskedMerge(top, bottom, mask)
+
+
         # remember the clip's original format
         original_format = clip.format
         # convert clip to RGB24 as it cannot read any other color space
@@ -64,13 +137,20 @@ class VSGAN:
                     clip=c
                 )
             ))
-        # if chunked, rejoin the chunked clips otherwise return the result
-        buffer = core.std.StackHorizontal([
-            core.std.StackVertical([results[0], results[1]]),
-            core.std.StackVertical([results[2], results[3]])
-        ]) if chunk else results[0]
-        # Convert back to the original color space
-        if original_format.color_family != buffer.format.color_family:
+        # if chunked, rejoin the chunked clips, otherwise return the result
+        if chunk:
+            tophalf = merge_horizontal(results[0], results[1], pad)
+            bottomhalf = merge_horizontal(results[2], results[3], pad)
+            buffer = merge_vertical(tophalf, bottomhalf, pad)
+        else:
+            buffer = results[0]
+        # Optionally convert back to the original color space
+        # Note that (unlike ToRGB), mvs.ToYUV "guesses" the original color space
+        # Based on whether the RGB clip is SD, HD, or UHD
+        # Upscaling is going to influence this decision, 
+        # so it's usually best to leave the output unchanged
+        # And let the user reconvert it with the appropriate arguments. 
+        if reconvert and (original_format.color_family != buffer.format.color_family):
             if original_format.color_family == vs.ColorFamily.RGB:
                 buffer = mvsfunc.ToRGB(buffer)
             if original_format.color_family == vs.ColorFamily.YUV:
@@ -99,18 +179,14 @@ class VSGAN:
 
     @staticmethod
     def chunk_clip(clip):
-        # split the clip horizontally into 2 images
-        crops = {
-            "left": core.std.CropRel(clip, left=0, top=0, right=clip.width / 2, bottom=0),
-            "right": core.std.CropRel(clip, left=clip.width / 2, top=0, right=0, bottom=0)
-        }
-        # split each of the 2 images from above, vertically, into a further 2 images (totalling 4 images per frame)
-        # top left, bottom left, top right, bottom right
+        #Split the image into 4 images, with padding
+        hcrop = clip.width/2 - pad
+        vcrop = clip.height/2 - pad
         return [
-            core.std.CropRel(crops["left"], left=0, top=0, right=0, bottom=crops["left"].height / 2),
-            core.std.CropRel(crops["left"], left=0, top=crops["left"].height / 2, right=0, bottom=0),
-            core.std.CropRel(crops["right"], left=0, top=0, right=0, bottom=crops["right"].height / 2),
-            core.std.CropRel(crops["right"], left=0, top=crops["right"].height / 2, right=0, bottom=0)
+            core.std.Crop(clip, bottom = vcrop, right = hcrop),
+            core.std.Crop(clip, bottom = vcrop, left = hcrop),
+            core.std.Crop(clip, top = vcrop, right = hcrop),
+            core.std.Crop(clip, top = vcrop, left = hcrop)
         ]
 
     @staticmethod
