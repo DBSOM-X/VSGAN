@@ -6,11 +6,8 @@
 #####################################################################
 
 import functools
-
-import mvsfunc
 import numpy as np
 import torch
-#import pkgutil
 import vapoursynth as vs
 from vapoursynth import core
 
@@ -18,7 +15,8 @@ from vapoursynth import core
 class VSGAN:
 
     def __init__(self, device="cuda"):
-        #Check for a Google TPU. Not needed now, as I can't get the any ESRGANmodels to load with it...  
+        #Check for a Google TPU. Not needed now, as ESRGANmodels seemingly won't load with it...  
+        #import pkgutil
         #if pkgutil.find_loader("torch_xla"):
         #    import torch_xla.core.xla_model as xm
         #    self.torch_device = xm.xla_device()
@@ -44,12 +42,16 @@ class VSGAN:
         self.rrdb_net_model.eval()
         self.rrdb_net_model = self.rrdb_net_model.to(self.torch_device)
 
-    def run(self, clip, chunk=False, reconvert=False, pad = 16):
+    #"Reconvert" specifies whether the output should be converted to the input format, if it's not already single precision RGB
+    #"Pad" is the number of pixels around each pixel that will overlap in chunk mode, to prevent seams. 
+    #"Matrix_s" is the target colorspace for RGB -> YUV. See http://www.vapoursynth.com/doc/functions/resize.html
+    def run(self, clip, chunk=False, pad = 16, reconvert=False, matrix_s = "709"):
         
         #Makes a horizontal or vertical grayscale, FP32 gradient ramp VS clip
         #White is on the right/bottom, black is on the left/top
         #Based on https://forum.doom9.org/showthread.php?p=1885013
         def make_gradient(WIDTH, HEIGHT, length, vertical = False):
+            
             #https://stackoverflow.com/questions/4337902/how-to-fill-opencv-image-with-one-solid-color
             def create_blank(width, height, color=(0, 0, 0)):
                 image = np.zeros((height, width, 3), np.uint8)
@@ -90,7 +92,7 @@ class VSGAN:
             clip = float32_vsclip(gradient)
             return core.std.Loop(clip, length)
         
-        #Like stackhorizontal, but with padding
+        #Like StackHorizontal, but with padding
         def merge_horizontal(left, right):
             lwidth = left.width - pad * self.model_scale
             rwidth = right.width - pad * self.model_scale
@@ -99,14 +101,11 @@ class VSGAN:
             mask = make_gradient(pad * 2 * self.model_scale, left.height, left.num_frames)
             mask = core.std.AddBorders(mask, left = lwidth - pad * self.model_scale, color = [0.0])
             mask = core.std.AddBorders(mask, right = rwidth - pad * self.model_scale, color = [1.0])
-
-            #raise Exception(lwidth, rwidth)
             left = core.std.AddBorders(left, right = rwidth - pad * self.model_scale)
             right = core.std.AddBorders(right, left = lwidth - pad * self.model_scale)
-            #raise Exception(left.width, left.height, right.width, right.height, mask.width, mask.height, mask.format)
             return core.std.MaskedMerge(left, right, mask)
 
-        #Like stackvertical, but with padding
+        # Like StackVertical, but with padding
         def merge_vertical(top, bottom):
             theight = top.height - pad * self.model_scale
             bheight = bottom.height - pad * self.model_scale
@@ -115,16 +114,15 @@ class VSGAN:
             mask = make_gradient(top.width, pad * 2 * self.model_scale, top.num_frames, vertical = True)
             mask = core.std.AddBorders(mask, top = theight - pad * self.model_scale, color = [0.0])
             mask = core.std.AddBorders(mask, bottom = bheight - pad * self.model_scale, color = [1.0])
-
             top = core.std.AddBorders(top, bottom = bheight - pad * self.model_scale)
             bottom = core.std.AddBorders(bottom, top = theight - pad * self.model_scale)
             return core.std.MaskedMerge(top, bottom, mask)
 
-        # remember the clip's original format
+        # Remember the clip's original format
         original_format = clip.format
-        # convert clip to RGB24 as it cannot read any other color space
-        buffer = mvsfunc.ToRGB(clip, depth=8)  # expecting RGB24 8bit
-        # send the clip array to execute()
+        # Convert clip to floating point RGB, as that's what ESRGAN uses internally
+        buffer = core.resize.Spline36(clip, format = vs.RGBS)
+        # Send the clip array to execute()
         results = []
         for c in self.chunk_clip(buffer, pad) if chunk else [buffer]:
             results.append(core.std.FrameEval(
@@ -138,24 +136,27 @@ class VSGAN:
                     clip=c
                 )
             ))
-        # if chunked, rejoin the chunked clips, otherwise return the result
+        # If chunked, rejoin the chunked clips, otherwise return the result.
         if chunk:
-            tophalf = merge_horizontal(core.resize.Spline36(results[0], format = vs.RGBS), core.resize.Spline36(results[1], format = vs.RGBS))
-            bottomhalf = merge_horizontal(core.resize.Spline36(results[2], format = vs.RGBS), core.resize.Spline36(results[3], format = vs.RGBS))
+            tophalf = merge_horizontal(results[0], results[1])
+            bottomhalf = merge_horizontal(results[2], results[3])
             buffer = merge_vertical(tophalf, bottomhalf)
         else:
-            buffer = core.resize.Spline36(results[0], format = vs.RGBS)
+            buffer = results[0]
         # Optionally convert back to the original color space
-        # Note that (unlike ToRGB), mvs.ToYUV "guesses" the original color space
-        # Based on whether the RGB clip is SD, HD, or UHD
+        # Note that (unlike ToRGB), mvs.ToYUV() guesses the original color space
+        # based on whether the RGB clip is SD, HD, or UHD.
         # Upscaling is going to influence this decision, 
         # so it's usually best to leave the output unchanged
-        # And let the user reconvert it with the appropriate arguments. 
+        # and let the user reconvert it with the appropriate arguments. 
         if reconvert and (original_format.color_family != buffer.format.color_family):
             if original_format.color_family == vs.ColorFamily.RGB:
-                buffer = mvsfunc.ToRGB(buffer)
+                buffer = core.resize.Spline36(buffer, format = original_format)
             if original_format.color_family == vs.ColorFamily.YUV:
-                buffer = mvsfunc.ToYUV(buffer, css=original_format.name[3:6])
+                buffer = core.resize.Spline36(buffer, format = original_format, matrix_s = matrix_s)
+                #import mvsfunc
+                #buffer = mvsfunc.ToYUV(buffer, css=original_format.name[3:6])
+                
         # return the new frame
         return buffer
 
@@ -200,7 +201,7 @@ class VSGAN:
         )
 
     @staticmethod
-    def cv2_imwrite(image, out_color_space="RGB24"): #TODO: "RGBS"
+    def cv2_imwrite(image, out_color_space="RGBS"): #TODO: "RGBS"
         """
         Alternative to cv2.imwrite() that will convert the data into an image readable by VapourSynth
         """
@@ -225,11 +226,11 @@ class VSGAN:
             for i, plane_num in enumerate(reversed(range(plane_count))):
                 # todo ; any better way to do this without storing the np.array in a variable?
                 # todo ; perhaps some way to directly copy it to s?
-                d = np.array(frame.get_write_array(plane_num), copy=False)
+                #d = 
                 # copy the value of d, into s[frame_num, :, :, plane_num]
-                np.copyto(d, image[n, :, :, i], casting="unsafe")
+                np.copyto(np.array(frame.get_write_array(plane_num), copy=False), image[n, :, :, i], casting="unsafe")
                 # delete the d variable from memory
-                del d
+                #del d
             return frame
 
         # take the blank clip and insert the new data into the planes and return it back to sender
@@ -243,12 +244,12 @@ class VSGAN:
         # get the frame being used
         frame = clip.get_frame(n)
         img = self.cv2_imread(frame=frame, plane_count=clip.format.num_planes)
-        img = img * 1.0 / 255 #TODO: Remove
+        #img = img * 1.0 / 255 #RGB24 -> RGBS
         img = torch.from_numpy(np.transpose(img[:, :, [2, 1, 0]], (2, 0, 1))).float()
         img_lr = img.unsqueeze(0)
         img_lr = img_lr.to(self.torch_device)
         with torch.no_grad():
             output = self.rrdb_net_model(img_lr).data.squeeze().float().cpu().clamp_(0, 1).numpy()
         output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))
-        output = (output * 255.0).round() #TODO: Remove
+        #output = (output * 255.0).round() #RGBS -> RGB24
         return self.cv2_imwrite(image=output, out_color_space=clip.format.name)
