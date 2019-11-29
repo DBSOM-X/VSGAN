@@ -92,8 +92,8 @@ class VSGAN:
         
         #Like stackhorizontal, but with padding
         def merge_horizontal(left, right):
-            lwidth = left.width - pad
-            rwidth = right.width - pad
+            lwidth = left.width - pad * self.model_scale
+            rwidth = right.width - pad * self.model_scale
             if (left.height, left.num_frames, left.format) != (right.height, right.num_frames, right.format):
                 raise Exception("Left and right clip must have the same height, format and number of frames!")
             mask = make_gradient(pad * 2 * self.model_scale, left.height, left.num_frames)
@@ -108,8 +108,8 @@ class VSGAN:
 
         #Like stackvertical, but with padding
         def merge_vertical(top, bottom):
-            theight = top.height - pad
-            bheight = bottom.height - pad
+            theight = top.height - pad * self.model_scale
+            bheight = bottom.height - pad * self.model_scale
             if (top.width, top.num_frames, top.format) != (bottom.width, bottom.num_frames, bottom.format):
                 raise Exception("Top and bottom clip must have the same height, format and number of frames!")
             mask = make_gradient(top.width, pad * 2 * self.model_scale, top.num_frames, vertical = True)
