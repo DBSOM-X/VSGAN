@@ -16,11 +16,12 @@ class VSGAN:
 
     def __init__(self, device="cuda"):
         #Check for a Google TPU. Not needed now, as ESRGANmodels seemingly won't load with it...  
-        #import pkgutil
-        #if pkgutil.find_loader("torch_xla"):
-        #    import torch_xla.core.xla_model as xm
-        #    self.torch_device = xm.xla_device()
-        self.torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
+        import pkgutil
+        if pkgutil.find_loader("torch_xla"):
+            import torch_xla.core.xla_model as xm
+            self.torch_device = xm.xla_device()
+        else:
+            self.torch_device = torch.device(device if torch.cuda.is_available() else "cpu")
         # Stubs
         self.model_file = None
         self.model_scale = None
@@ -120,8 +121,13 @@ class VSGAN:
 
         # Remember the clip's original format
         original_format = clip.format
+        if original_format != vs.RGBS:
+            raise Exception("VSGAN input must be 32 bit RGB!")
+        buffer = clip
         # Convert clip to floating point RGB, as that's what ESRGAN uses internally
-        buffer = core.resize.Spline36(clip, format = vs.RGBS)
+        #import mvsfunc as mvf
+        #buffer = core.resize.Spline36(clip, format = vs.RGBS)
+        #buffer = mvf.ToRGB(clip, depth = 32)
         # Send the clip array to execute()
         results = []
         for c in self.chunk_clip(buffer, pad) if chunk else [buffer]:
