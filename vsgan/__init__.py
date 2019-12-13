@@ -121,8 +121,8 @@ class VSGAN:
 
         # Remember the clip's original format
         original_format = clip.format
-        if original_format != vs.RGBS:
-            raise Exception("VSGAN input must be 32 bit RGB!")
+        if (original_format.color_family, original_format.bits_per_sample, original_format.sample_type) != (vs.RGB, 32, vs.FLOAT):
+            raise Exception("VSGAN input must be 32 bit RGB, not " + original_format.name)
         buffer = clip
         # Convert clip to floating point RGB, as that's what ESRGAN uses internally
         #import mvsfunc as mvf
