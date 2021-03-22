@@ -6,6 +6,7 @@
 #####################################################################
 
 import functools
+import mvsfunc as mvsfunc
 
 import numpy as np
 import torch
